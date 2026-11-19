@@ -1,0 +1,541 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Serverless data pipeline - a CSV uploaded to S3 triggers a VPC Lambda that validates it,
+  upserts rows into a private RDS MySQL database over TLS, and emails a summary through SNS.
+  The VPC has no internet gateway or NAT; AWS APIs are reached through VPC endpoints.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: S3 incoming/*.csv -> Lambda (private subnets) -> RDS MySQL (TLS); Lambda -> SNS + Secrets Manager via interface endpoints; S3 via gateway endpoint; failed events -> SQS DLQ
+    must:
+      - no IGW/NAT in this VPC; every AWS API call goes through a VPC endpoint
+      - deploy with scripts/deploy.sh (builds ../build/package, then aws cloudformation package)
+    ref:
+      - { at: README.md, has: architecture + deploy/test/cleanup steps, scope: repo }
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: serverless-pipeline
+    AllowedPattern: '^[a-z][a-z0-9-]{2,19}$'
+    ConstraintDescription: 3-20 characters - lowercase letters, digits and hyphens, starting with a letter.
+    Description: Lowercase name used in resource names; also part of the S3 bucket name.
+  NotificationEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Must be a valid email address.
+    Description: Address that receives the processing summaries (confirm the SNS subscription email).
+  VpcCidr:
+    Type: String
+    Default: 10.50.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    ConstraintDescription: Must be a /16 CIDR block.
+    Description: CIDR block for the VPC.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    AllowedValues: [db.t4g.micro, db.t3.micro, db.t4g.small]
+    Description: RDS instance class.
+  MySqlVersion:
+    Type: String
+    Default: '8.4'
+    AllowedValues: ['8.4', '8.0']
+    Description: MySQL major version (RDS picks the current default minor version).
+
+Resources:
+  # ---------------------------------------------------------------- Network (fully private)
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: isolated VPC with no internet path; DNS needed for interface endpoint private DNS
+        must:
+          - EnableDnsSupport & EnableDnsHostnames true, else endpoint private DNS fails
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 2, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-a'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-b'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------- Security groups
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: no ingress; 443 egress can only reach VPC endpoints because the VPC has no IGW/NAT
+    Properties:
+      GroupDescription: Pipeline Lambda - outbound to RDS and VPC endpoints only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to S3, SNS and Secrets Manager VPC endpoints (no internet route exists)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+
+  LambdaToDbEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt LambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !GetAtt DbSecurityGroup.GroupId
+      Description: MySQL to RDS
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL - only reachable from the pipeline Lambda
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No outbound traffic needed (security groups are stateful)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-sg'
+
+  DbIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+      Description: MySQL from the Lambda security group
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - HTTPS from the pipeline Lambda only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+          Description: HTTPS from the Lambda function
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No outbound traffic needed
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-endpoint-sg'
+
+  # ---------------------------------------------------------------- VPC endpoints
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Lambda reads uploaded files; endpoint policy limits the whole VPC to reading incoming/ in this one bucket (exfiltration guard)
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadIncomingFilesOnly
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}/incoming/*'
+
+  SnsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: SNS publish without internet; single subnet to halve hourly endpoint cost (both Lambda subnets can reach it)
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !GetAtt EndpointSecurityGroup.GroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublishToPipelineTopicOnly
+            Effect: Allow
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !GetAtt EndpointSecurityGroup.GroupId
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadDbSecretOnly
+            Effect: Allow
+            Principal: '*'
+            Action: secretsmanager:GetSecretValue
+            Resource: !GetAtt Database.MasterUserSecret.SecretArn
+
+  # ---------------------------------------------------------------- Database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the pipeline database
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: forces TLS on every DB connection (encryption in transit)
+        must:
+          - Family must match MySqlVersion
+    Properties:
+      Description: Require TLS for all client connections
+      Family: !Sub 'mysql${MySqlVersion}'
+      Parameters:
+        require_secure_transport: '1'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: private MySQL; RDS-managed master secret (auto-rotated, never seen by a human); Delete policy so lab teardown leaves no billable orphans (use Snapshot in prod)
+        must:
+          - PubliclyAccessible false
+          - StorageEncrypted true (cannot be changed after creation)
+        mutable: change-with-constraints
+        mutability:
+          StorageEncrypted: must-never-change
+          DBName: must-never-change
+    Properties:
+      Engine: mysql
+      EngineVersion: !Ref MySqlVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: pipeline
+      MasterUsername: pipeline_admin
+      ManageMasterUserPassword: true
+      DBParameterGroupName: !Ref DbParameterGroup
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt DbSecurityGroup.GroupId
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------- Messaging
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Data pipeline
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: keeps events that still fail after Lambda's retry, for inspection and replay
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ---------------------------------------------------------------- Lambda
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least privilege - read incoming/ only, read one secret, publish to one topic, send to one DLQ; VPC access policy for ENIs + logs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: pipeline-least-privilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadIncomingFiles
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}/incoming/*'
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Sid: PublishSummaries
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+              - Sid: DeadLetterQueue
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: python3.12 arm64 (cheaper); in VPC to reach private RDS; 60s timeout covers TLS connect + 10k-row upsert
+        must:
+          - Code path is packaged by scripts/deploy.sh (aws cloudformation package)
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3002   # local Code path is intentional; deploy.sh runs 'aws cloudformation package'
+    Properties:
+      Description: Validates order CSV files from S3, loads them into RDS and emails a summary
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: app.lambda_handler
+      Code: ../build/package
+      Role: !GetAtt ProcessorRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !GetAtt LambdaSecurityGroup.GroupId
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt Database.Endpoint.Address
+          DB_PORT: !GetAtt Database.Endpoint.Port
+          DB_NAME: pipeline
+          DB_SECRET_ARN: !GetAtt Database.MasterUserSecret.SecretArn
+          TOPIC_ARN: !Ref NotificationTopic
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      LoggingConfig:
+        LogGroup: !Ref ProcessorLogGroup
+        LogFormat: Text
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ProcessorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+      MaximumEventAgeInSeconds: 3600
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: SourceArn + SourceAccount prevent confused-deputy invokes; bucket ARN built from its known name to avoid a circular dependency
+    Properties:
+      FunctionName: !GetAtt ProcessorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+
+  # ---------------------------------------------------------------- Storage
+  IncomingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: landing zone for CSV uploads; fixed name pattern so IAM, endpoint policy and Lambda permission can reference it without a cycle
+        must:
+          - BucketName must stay ProjectName-AccountId-Region (IAM, endpoint policy, permission depend on it)
+          - keep public access fully blocked
+    Properties:
+      BucketName: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  IncomingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref IncomingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt IncomingBucket.Arn
+              - !Sub '${IncomingBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+Outputs:
+  IncomingBucketName:
+    Description: Upload CSV files to s3://<this bucket>/incoming/
+    Value: !Ref IncomingBucket
+  FunctionName:
+    Description: Lambda function that processes uploads
+    Value: !Ref ProcessorFunction
+  LogGroupName:
+    Description: CloudWatch Logs group for the function
+    Value: !Ref ProcessorLogGroup
+  NotificationTopicArn:
+    Description: SNS topic for processing summaries
+    Value: !Ref NotificationTopic
+  DeadLetterQueueUrl:
+    Description: Events that failed after retry
+    Value: !Ref DeadLetterQueue
+  DbEndpoint:
+    Description: Private RDS endpoint (reachable only from the Lambda security group)
+    Value: !GetAtt Database.Endpoint.Address

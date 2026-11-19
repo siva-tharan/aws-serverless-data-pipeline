@@ -1,0 +1,6 @@
+order_id,customer_name,product,quantity,unit_price,order_date
+ORD-1001,Priya Raman,Laptop,1,55999.00,2026-11-01
+ORD-1002,Arun Kumar,Wireless Mouse,2,799.00,2026-11-01
+ORD-1003,Meena Iyer,Office Chair,1,8499.50,2026-11-02
+ORD-1004,Karthik S,USB-C Hub,3,1299.00,2026-11-02
+ORD-1005,Divya N,Monitor 27in,2,17999.00,2026-11-03

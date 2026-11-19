@@ -1,0 +1,7 @@
+order_id,customer_name,product,quantity,unit_price,order_date
+ORD-2001,Lakshmi P,Keyboard,1,1499.00,2026-11-05
+ORD-2002,Vijay M,Webcam,two,2499.00,2026-11-05
+ORD-2003,Anitha R,Headphones,1,-100,2026-11-06
+ORD-2004,,Desk Lamp,1,999.00,2026-11-06
+ORD-2005,Suresh K,Router,1,3299.00,06-11-2026
+ORD-2006,Revathi B,SSD 1TB,2,6499.00,2026-11-07
